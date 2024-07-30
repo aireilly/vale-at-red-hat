@@ -1,0 +1,8 @@
+---
+extends: existence
+scope: raw
+level: error
+nonword: true
+message: "Source code block contains an unescaped backslash at the end of the line."
+tokens:
+  - '(-{3,}\n.*)+\\$'
