@@ -47,7 +47,3 @@ exceptions:
   - Missing
   - Leading
   - Pending
-# action:
-#   name: suggest
-#   params:
-#     - NoGerundsInTitles.tengo
