@@ -60,6 +60,32 @@ def record_coverage(rule_name, extends_type, level, fidelity, notes=""):
     }
 
 
+def _fidelity_for(total, skipped, partial):
+    """Derive a coverage fidelity label and note from lookaround handling.
+
+    Args:
+        total: Number of tokens or swap entries in the rule.
+        skipped: Entries dropped whole because every alternative used a
+            lookaround.
+        partial: Entries kept after dropping some lookaround alternatives.
+    """
+    if not skipped and not partial:
+        return "Full", ""
+
+    parts = []
+    if skipped:
+        parts.append(
+            "%d of %d %s skipped (lookaround unsupported in XPath 2.0)"
+            % (skipped, total, "entry" if total == 1 else "entries")
+        )
+    if partial:
+        parts.append(
+            "%d %s kept after dropping lookaround alternatives"
+            % (partial, "entry" if partial == 1 else "entries")
+        )
+    return "Partial", "; ".join(parts)
+
+
 def write_coverage_md():
     """Write COVERAGE.md summarizing rule conversion fidelity."""
     filepath = os.path.join(REPO_ROOT, "schematron", "COVERAGE.md")
@@ -130,6 +156,8 @@ def handle_existence(rule_name, data):
     flags = "'i'" if ignorecase else ""
     word_bounded = not nonword
 
+    skipped = 0
+    partial = 0
     for token in tokens:
         token_str = str(token)
         if prefix:
@@ -137,12 +165,28 @@ def handle_existence(rule_name, data):
         else:
             full_pattern = token_str
 
-        converted, warnings = convert_regex_to_xpath(
-            full_pattern, word_bounded=word_bounded
-        )
+        kept_pattern, dropped = drop_unsupported_alternatives(full_pattern)
 
-        for w in warnings:
-            rule_el.append(etree.Comment(" %s " % w))
+        if dropped:
+            rule_el.append(etree.Comment(_xml_comment_text(
+                "Dropped lookaround alternative(s), unsupported in "
+                "XPath 2.0: %s" % " | ".join(dropped)
+            )))
+
+        if kept_pattern is None:
+            rule_el.append(etree.Comment(_xml_comment_text(
+                "Skipped token, lookaround unsupported in XPath 2.0: %s"
+                % token_str
+            )))
+            skipped += 1
+            continue
+
+        if dropped:
+            partial += 1
+
+        converted, _ = convert_regex_to_xpath(
+            kept_pattern, word_bounded=word_bounded
+        )
 
         report = etree.SubElement(rule_el, SCH + "report")
 
@@ -161,15 +205,20 @@ def handle_existence(rule_name, data):
             msg = message_template
         report.text = msg
 
-    has_warnings = any(
-        isinstance(child, etree._Comment) and "Stripped" in str(child.text)
-        for child in rule_el
-    )
-    fidelity = "Simplified" if has_warnings else "Full"
-    notes = "Lookbehind/lookahead stripped" if has_warnings else ""
+    if not rule_el.findall(SCH + "report"):
+        record_coverage(
+            rule_name, "existence", level, "Skipped",
+            "All %d tokens use lookarounds unsupported in XPath 2.0"
+            % len(tokens)
+        )
+        _remove_stale_output(rule_name)
+        return False
+
+    fidelity, notes = _fidelity_for(len(tokens), skipped, partial)
     record_coverage(rule_name, "existence", level, fidelity, notes)
 
     write_schematron_file(rule_name, schema)
+    return True
 
 
 def handle_substitution(rule_name, data):
@@ -199,16 +248,34 @@ def handle_substitution(rule_name, data):
 
     flags = "'i'" if ignorecase else ""
 
+    skipped = 0
+    partial = 0
     for bad_pattern, replacement in swap.items():
         bad_str = str(bad_pattern)
         repl_str = str(replacement)
 
-        converted, warnings = convert_regex_to_xpath(
-            bad_str, word_bounded=word_bounded
-        )
+        kept_pattern, dropped = drop_unsupported_alternatives(bad_str)
 
-        for w in warnings:
-            rule_el.append(etree.Comment(" %s " % w))
+        if dropped:
+            rule_el.append(etree.Comment(_xml_comment_text(
+                "Dropped lookaround alternative(s), unsupported in "
+                "XPath 2.0: %s" % " | ".join(dropped)
+            )))
+
+        if kept_pattern is None:
+            rule_el.append(etree.Comment(_xml_comment_text(
+                "Skipped swap, lookaround unsupported in XPath 2.0: %s"
+                % bad_str
+            )))
+            skipped += 1
+            continue
+
+        if dropped:
+            partial += 1
+
+        converted, _ = convert_regex_to_xpath(
+            kept_pattern, word_bounded=word_bounded
+        )
 
         report = etree.SubElement(rule_el, SCH + "report")
 
@@ -230,15 +297,20 @@ def handle_substitution(rule_name, data):
                 msg = message_template
         report.text = msg
 
-    has_warnings = any(
-        isinstance(child, etree._Comment) and "Stripped" in str(child.text)
-        for child in rule_el
-    )
-    fidelity = "Simplified" if has_warnings else "Full"
-    notes = "Lookbehind/lookahead stripped" if has_warnings else ""
+    if not rule_el.findall(SCH + "report"):
+        record_coverage(
+            rule_name, "substitution", level, "Skipped",
+            "All %d swaps use lookarounds unsupported in XPath 2.0"
+            % len(swap)
+        )
+        _remove_stale_output(rule_name)
+        return False
+
+    fidelity, notes = _fidelity_for(len(swap), skipped, partial)
     record_coverage(rule_name, "substitution", level, fidelity, notes)
 
     write_schematron_file(rule_name, schema)
+    return True
 
 
 def handle_conditional(rule_name, data):
@@ -495,6 +567,82 @@ def _has_top_level_alternation(pattern):
     return False
 
 
+def _split_top_level_alternation(pattern):
+    """Split a pattern on | characters that sit outside parentheses.
+
+    Mirrors _has_top_level_alternation: escaped characters and grouped
+    subexpressions (including lookarounds) are opaque, so their internal
+    | characters never split the pattern.
+    """
+    parts = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == '\\':
+            i += 2
+            continue
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == '|' and depth == 0:
+            parts.append(pattern[start:i])
+            start = i + 1
+        i += 1
+    parts.append(pattern[start:])
+    return parts
+
+
+LOOKAROUND_RE = re.compile(r"\(\?<?[=!]")
+
+
+def _contains_lookaround(pattern):
+    """Return True if the pattern uses a lookaround construct.
+
+    XPath 2.0 / XSD regular expressions have no lookbehind or lookahead
+    ((?<!...), (?<=...), (?!...), (?=...)), so any alternative that relies
+    on one cannot be expressed faithfully.
+    """
+    return bool(LOOKAROUND_RE.search(pattern))
+
+
+def drop_unsupported_alternatives(pattern):
+    """Drop top-level alternatives that use an unsupported lookaround.
+
+    Vale patterns often OR several terms together, and only some of them
+    carry a lookaround guard, for example
+    "(?<!Red Hat )OpenStack Platform|RHOS|RH-OSP". The guarded alternative
+    cannot be ported to XPath 2.0, but the plain ones can, so the guarded
+    alternative is removed and the rest are kept.
+
+    Returns (kept_pattern, dropped) where kept_pattern is the surviving
+    pattern (None when every alternative used a lookaround, meaning the
+    whole entry must be skipped) and dropped is the list of removed
+    alternatives. A pattern with no lookaround is returned unchanged with
+    an empty dropped list.
+    """
+    if not _contains_lookaround(pattern):
+        return pattern, []
+
+    alternatives = _split_top_level_alternation(pattern)
+    kept = [a for a in alternatives if not _contains_lookaround(a)]
+    dropped = [a for a in alternatives if _contains_lookaround(a)]
+
+    if not kept:
+        return None, dropped
+    return "|".join(kept), dropped
+
+
+def _xml_comment_text(text):
+    """Wrap text so it is legal inside an XML comment.
+
+    XML comments may not contain "--" or end with "-".
+    """
+    return " %s " % text.replace("--", "- -")
+
+
 def _strip_word_boundaries(pattern):
     """Replace \\b with XPath 2.0 compatible word boundary approximations.
 
@@ -546,9 +694,10 @@ def _add_word_boundaries(pattern):
 def convert_regex_to_xpath(pattern, word_bounded=False):
     """Convert a Vale regex pattern to an XPath 2.0 compatible regex.
 
-    Strips unsupported constructs (negative lookbehind/lookahead),
-    optionally adds word boundaries, and adjusts whitespace matching
-    for XML text nodes.
+    Callers must remove constructs that XPath 2.0 cannot express
+    (lookbehind/lookahead) before calling; see
+    drop_unsupported_alternatives. This optionally adds word boundaries
+    and adjusts whitespace matching for XML text nodes.
 
     Args:
         pattern: The regex pattern to convert.
@@ -557,21 +706,11 @@ def convert_regex_to_xpath(pattern, word_bounded=False):
             rules when nonword=False.
 
     Returns:
-        (converted_pattern, warnings) where warnings is a list of strings
-        describing what was stripped.
+        (converted_pattern, warnings) where warnings is always empty; it is
+        retained for call-site compatibility.
     """
     warnings = []
     result = pattern
-
-    lookbehind_re = r"\(\?<![^)]*\)"
-    if re.search(lookbehind_re, result):
-        warnings.append("Stripped negative lookbehind (?<!...) — word boundaries added")
-        result = re.sub(lookbehind_re, "", result)
-
-    lookahead_re = r"\(\?![^)]*\)"
-    if re.search(lookahead_re, result):
-        warnings.append("Stripped negative lookahead (?!...) — word boundaries added")
-        result = re.sub(lookahead_re, "", result)
 
     # In XML text nodes, \s matches newline+indentation from source
     # formatting. Replace quantified \s with space-only match to avoid
@@ -632,6 +771,13 @@ def make_schema_element(title, source_comment, extends_type, level):
     return schema
 
 
+def _remove_stale_output(rule_name):
+    """Delete a previously generated .sch file for a now-skipped rule."""
+    filepath = os.path.join(OUTPUT_DIR, "%s.sch" % rule_name)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+
+
 def write_schematron_file(rule_name, schema_element):
     """Write a sch:schema element to a .sch file."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -689,7 +835,10 @@ def generate_rule(rule_name):
         # Dispatch to type handler (will be implemented in Tasks 2-4)
         handler = TYPE_HANDLERS.get(extends)
         if handler:
-            handler(rule_name, rule_data)
+            if handler(rule_name, rule_data) is False:
+                print("Skipping %s (all patterns use unsupported "
+                      "lookarounds)" % rule_name)
+                return None
             return rule_name
         else:
             print("Warning: No handler for type '%s' (rule: %s)" % (extends, rule_name), file=sys.stderr)
